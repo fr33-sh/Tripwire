@@ -1,5 +1,0 @@
-include *.md
-include *.txt
-include setup.*
-include LICENSE
-recursive-include pywebpush *.py

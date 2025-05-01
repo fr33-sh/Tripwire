@@ -1,2 +1,0 @@
-[console_scripts]
-pywebpush = "pywebpush.__main__:main"
