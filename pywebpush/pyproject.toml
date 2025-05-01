@@ -1,0 +1,41 @@
+[build-system]
+# This uses the semi-built-in "setuptools" which is currently the
+# python pariah, but there are a lot of behaviors that still carry.
+# For more info see https://packaging.python.org/en/latest/
+# (although, be fore-warned, it gets fairly wonky and obsessed with
+# details that you may not care about.)
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywebpush"
+version = "2.0.3"
+license = {text = "MPL-2.0"}
+authors = [{ name = "JR Conlin", email = "src+webpusher@jrconlin.com" }]
+description = "WebPush publication library"
+readme = "README.md"
+keywords = ["webpush", "vapid", "notification"]
+classifiers = [
+    "Topic :: Internet :: WWW/HTTP",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+]
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/web-push-libs/pywebpush"
+
+[project.optional-dependencies]
+dev = ["black", "mock", "pytest"]
+
+# create the `pywebpush` helper using `python -m pip install --editable .`
+[project.scripts]
+pywebpush = "pywebpush.__main__:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = "requirements.txt"}
+
+[tool.setuptools.packages.find]
+include = ["pywebpush*"]

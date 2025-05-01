@@ -1,0 +1,5 @@
+{
+ "sub": "mailto:admin@example.com",
+ "aud": "https://push.services.mozilla.com"
+}
+
