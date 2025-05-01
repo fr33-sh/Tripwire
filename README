@@ -1,1 +1,121 @@
-Testing1
+## Installation
+
+### Picamera2
+Install Picamera2 from **APT**:
+```
+sudo apt install python3-picamera2 --no-install-recommends
+```
+Note: Installing picamera2 from pip probably won't work due to some compatibility issues. See...
+
+### Python virtual environment and dependencies
+Create and activate a Python virtual environment with system Python packages included, so that picamera2 will also be available in the virtual environment.
+```
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+```
+
+Install Tripwire's dependencies specified in `requirements.txt`:
+```
+pip install -r requirements.txt
+```
+
+Install pywebpush and Python VAPID tool. Run the following commands under `pywebpush/` as well as under `vapid/python/`.
+```
+pip install -r requirements.txt
+pip install -e .
+```
+
+### Caddy
+Install xcaddy following the instruction on its GitHub: https://github.com/caddyserver/xcaddy
+Note: If you built it from source with `go install ...`, the built xcaddy binary will probably be located at `/home/pi/go/bin/xcaddy`, or `$GOBIN/xcaddy`. See `go help install`.
+
+Using xcaddy, build Caddy with these two plugins:
+1. The dynamic DNS plugin.
+2. The specific DNS provider plugin for the domain registrar you are using.
+```
+xcaddy build --with github.com/mholt/caddy-dynamicdns --with github.com/caddy-dns/<YOUR DNS PROVIDER>
+```
+Replace <YOUR DNS PROVIDER> with the name of your DNS provider. If you don't know who your DNS provider is, then it is probably the same as your domain registrar (where you get the domain). All available DNS provider plugins can be found here: https://caddyserver.com/docs/modules/. Their names start with a prefix of "dns.providers". The description of each plugin shows the exact URL to be used for the second `--with` in the command. You can also find the GitHub repositories of these DNS provider plugins here: https://github.com/orgs/caddy-dns/repositories
+
+So, if your DNS provider is Duck DNS, then you should run this command:
+```
+xcaddy build --with github.com/mholt/caddy-dynamicdns --with github.com/caddy-dns/duckdns
+```
+
+The built Caddy custom binary `caddy` will be located at whichever directory this command is run. For convenience, move it into a directory on `$PATH`, such as `/home/pi/.local/bin/`.
+
+For Caddy to be able to bind to the system ports (0-1023), it needs to have the corresponding capabilities. Otherwise, running Caddy will result in a permission error.
+```
+sudo setcap CAP_NET_BIND_SERVICE=+eip ~/.local/bin/caddy
+```
+Note: This is still necessary even if you are serving the web app on non-system ports, because Caddy by default tries to listen to port 80 for automatic HTTPS redirection.
+
+### Setup the instance directory
+Each instance of Tripwire deployment needs its own instance directory. It needs to be scaffolded:
+```
+mkdir instance
+cd instance/
+mkdir cam_tuning_captures
+mkdir captures
+mkdir vapid
+```
+
+### Create a server config
+Create a `server_config.yaml` under `instance/` and fill in the content:
+```
+MIN_SSIM_VS_INIT: ...
+MIN_SSIM_VS_NEXT: ...
+
+POST_DETECTION:
+  SECS_DEL_KEYS: 5
+  CAM_CAP_INTERVAL: 1
+
+KEEP_PHOTOS_IN_MEM_FOR: 3600
+KEEP_PHOTOS_IN_DISK_FOR: 18000
+```
+
+The `MIN_SSIM_VS_INIT` and `MIN_SSIM_VS_NEXT` should be set up after tuning the camera.
+For rest of the parameters:
+TODO: Document
+
+### Generate VAPID key pair
+A VAPID key pair is needed for Tripwire's Flask server to send out web push notifications. Run this command under `instance/vapid/`.
+```
+vapid --gen
+```
+Note: Do not rename the generated keys.
+
+### Environment Variables
+Create a shell script named `tripwire.caddy.env.sh` that exports some environment variables upon execution. These variables will be automatically plugged into Caddy's config file `Caddyfile`. It is recommended to put this script outside of Tripwire's directory to avoid accidentally committing and leaking it to Git. The content of the shell script should be:
+```
+export TRIPWIRE_DOM_REG='...'
+export TRIPWIRE_DOM_REG_TOK='...'
+export TRIPWIRE_DOM='...'
+export TRIPWIRE_USER='...'
+export TRIPWIRE_PW='...'
+```
+Note: The single quotes around the ... are necessary, especially for `TRIPWIRE_PW`. The script will break without them.
+
+Here is an explanation for these environment variables:
+- `TRIPWIRE_DOM_REG` should be the name of your domain registrar or DNS provider.
+- `TRIPWIRE_DOM_REG_TOK` should be the API token provided by your domain registrar or DNS provider.
+- `TRIPWIRE_DOM` should be the domain name you got for Tripwire.
+- `TRIPWIRE_USER` should be the username you want to use for Caddy's Basic Auth.
+- `TRIPWIRE_PW` should be the **HASHED AND ENCODED** passphrase you want to use for Caddy's Basic Auth. To generate the hashed and encoded passphrase: 
+  - First, generate a secure random passphrase using tools like KeePassXC. You probably want a "passphrase" made with several (at least 6) English words, rather than a "password" made with a long string of random character, so that you can actually type it when you are accessing Tripwire on a mobile device when you are away from home.
+  - Second, run `caddy hash-password`. At the prompt, paste in your plaintext passphrase. It will return the hashed and encoded passphrase, which you can paste after `TRIPWIRE_PW`.
+
+An example of `tripwire.caddy.env.sh`:
+```
+export TRIPWIRE_DOM_REG='duckdns'
+export TRIPWIRE_DOM_REG_TOK='abcde'
+export TRIPWIRE_DOM='my-tripwire.com'
+export TRIPWIRE_USER='Alice'
+export TRIPWIRE_PW='$2a$14$.lGj0kTww2Mi1Z0daBbd9eG/WxHzNjQ6Feo/it5IWPODFtYYFhg2e'
+```
+
+Create another shell script named `tripwire.flask.env.sh` with the content as:
+```
+export TRIPWIRE_VAPID_APP_SERVER_KEY='...'
+```
+The value here can be obtained by running `vapid --applicationServerKey` under `instance/vapid/`.

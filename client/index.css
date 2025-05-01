@@ -1,0 +1,26 @@
+#image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(320px, 33%), 1fr));
+}
+
+.image-grid-bar {
+  display: grid;
+  grid-template-columns: 4fr 1fr 1fr 1fr 1fr;
+}
+
+.image-grid-img {
+  max-width: 100%;
+}
+
+#time, #pir-secret, #cam-secret, #pubkey-pem, #storage-status, #memory-status, #photo-counts {
+  white-space: pre-line;
+}
+
+#storage-errors {
+  color: red;
+  white-space: pre-line;
+}
+
+.indexeddb-header {
+  display: inline-block;
+}

@@ -1,0 +1,6 @@
+[submodule "pywebpush"]
+	path = pywebpush
+	url = https://github.com/web-push-libs/pywebpush.git
+[submodule "vapid"]
+	path = vapid
+	url = https://github.com/web-push-libs/vapid.git

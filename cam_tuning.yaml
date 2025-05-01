@@ -1,0 +1,5 @@
+img_width: 800
+img_height: 450
+init_delay: 10
+interval: 5
+num_imgs: 10

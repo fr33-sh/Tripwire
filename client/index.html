@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tripwire</title>
+
+  <!-- For IOS Safari, the PWA manifest must be inlined because if it is
+  in another file, somehow Safari won't pass the basic auth creds when
+  fetching the manifest, even with `crossorigin="use-credentials"`.
+
+  Note that this seems to make the app not installable on at least 
+  desktop Brave. The icons don't seem to work either. -->
+  <link rel="manifest" href='data:application/manifest+json,{"short_name": "Tripwire","name": "Tripwire AEM","start_url": "/","icons": [{"src": "/test_icon_192.png","sizes": "192x192","type": "image/png"},{"src": "/test_icon_512.png","sizes": "512x512","type": "image/png"}],"display": "standalone"}' />
+
+  <!-- For browsers other than IOS Safari, this is the
+  common way to link to the manifest. -->
+  <!--<link rel="manifest" href="/manifest.json" crossorigin="use-credentials" /> -->
+
+  <link rel="stylesheet" href="/index.css">
+</head>
+
+<body>
+  <h1>Tripwire</h1>
+
+  <!-- IOS requires user interaction before asking for permission. -->
+  <button id="enable-push">Enable Push Notification</button>
+
+  <!-- A button for reloading the page. -->
+  <button id="full-reload">Full Reload</button>
+
+  <!-- The sensor secrets. -->
+  <h2>Secrets</h2>
+  <p id="pir-secret"></p>
+  <p id="cam-secret"></p>
+  <p id="pubkey-pem"></p>
+
+  <h2>Time</h2>
+  <p id="time"></p>
+
+  <div>
+    <h2>Network Discontinuity Log</h2>
+    <p>Here is a log of discontinuity when receiving secrets.</p>
+    <p id='secrets-discontinuity-log-p'></p>
+  </div>
+
+  <h2>Browser Storage Status</h2>
+  <p id="photo-counts"></p>
+  <h4>Memory</h4>
+  <p id="memory-status"></p>
+  <div>
+    <h4 class="indexeddb-header">IndexedDB</h4>
+  </div>
+  <label for="disable-indexeddb">
+    <input type="checkbox" id="disable-indexeddb" name="disable-indexeddb">
+    Disable IndexedDB (Recommended for Chromium-Based Browsers)
+  </label>
+  <p id="storage-status"></p>
+  <p id="storage-errors"></p>
+  <p id="storage-free-up"></p>
+
+  <div>
+    <h2>Live Photos</h2>
+    <p>Starting time and ending time of the photos to show, in terms of minutes after the server started.</p>
+    <p>(A blank starting time means from the start. A blank ending time means till the end.)</p>
+    <label for="photos-time-range-start-input">Start</label>
+    <input
+      type="text"
+      id="photos-time-range-start-input"
+      name="photos-time-range-start-input"
+    />
+    <label for="photos-time-range-end-input">End</label>
+    <input
+      type="text"
+      id="photos-time-range-end-input"
+      name="photos-time-range-end-input"
+    />
+    <button id="photos-time-range-confirm-button">Confirm</button>
+    <br><br>
+    <label for="page-num-input">Page Number:</label>
+    <input
+        type="text"
+        id="page-num-input"
+        name="page-num-input"
+    />
+    <button id="page-num-button">Go</button>
+    <button id="photo-log-prev-button">Previous Page</button>
+    <button id="photo-log-next-button">Next Page</button>
+    <br><br>
+    <label for="photos-per-page-sel">Photos Per Page:</label>
+    <select
+      id="photos-per-page-sel"
+      name="photos-per-page-sel"
+      onchange="onPhotosPerPageSelected"
+    >
+      <option value=60>60</option>
+      <option value=120>120</option>
+      <option value=180>180</option>
+      <option value=300>300</option>
+      <option value=600>600</option>
+      <option value=900>900</option>
+      <option value=1200>1200</option>
+    </select>
+    <p id="photos-time-range-log"></p>
+  </div>
+
+  <!-- A grid showing a stream of pictures from the camera. -->
+  <div id="image-grid"></div>
+
+  <!-- Make it easier to debug on phones. -->
+  <div id="log">
+    <h2>Here are some logs</h2>
+  </div>
+
+
+  <script src="/tools.js"></script>
+  <script src="/index.js"></script>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+  <!-- Connect to server's socket.io and handle incoming messages. -->
+  <script type="module">
+    // Represent an image with optional signature verification,
+    // which has the image's Base64, and possibly a bool indicating whether
+    // the signature is verified, for sigs sent after server erases the
+    // secrets but before it erases the priv key. If the bool is null
+    // then it means no sig was received for this image.
+    class PhotoData {
+      constructor(photoBase64, sigVeri) {
+        this.photoBase64 = photoBase64;
+        this.sigVeri = sigVeri;
+      }
+
+      // When will JavaScript have proper way to measure object size? Never?
+      getSizeInBytes() {
+        return this.photoBase64.length + this.sigVeri.length;
+      }
+    }
+
+    // Const strings representing signature verification result
+    // Not using an enum because JS Symbol is not serializable and
+    // therefore can't be stored in IndexedDB.
+    const SIGVERI_UNSUPPORTED = "CANT SIG";
+    const SIGVERI_NO_SIG = "NO SIG";
+    const SIGVERI_BAD_SIG = "BAD SIG";
+    const SIGVERI_GOOD_SIG = "GOOD SIG";
+
+    function addImageCells(imageGrid, count, positioning) {
+      for (let i = 0; i < count; i++) {
+        // The cell container
+        let cell = document.createElement('div');
+        cell.classList.add('image-grid-cell');
+        if (positioning === 'append')
+          imageGrid.appendChild(cell);
+        else if (positioning === 'prepend')
+          imageGrid.prepend(cell);
+        else
+          console.assert(
+            false,
+            'The "positioning" argument of addImageCells can only be "append" or "prepend".'
+          )
+        // The div for the timestamp and verification symbols.
+        let bar = document.createElement('div');
+        bar.classList.add('image-grid-bar');
+        cell.appendChild(bar);
+        // The <p> for the timestamp
+        // Append it first so that it's above the img.
+        let datetimeP = document.createElement('p');
+        datetimeP.classList.add('image-grid-datetime-p');
+        datetimeP.textContent = 'Time: N/A';
+        bar.appendChild(datetimeP);
+        // The <p> for where the photo comes from.
+        let sourceP = document.createElement('p');
+        sourceP.classList.add('image-grid-source-p');
+        sourceP.textContent = 'N/A';
+        bar.appendChild(sourceP);
+        // The PIR secret symbol
+        let pirSymbol = document.createElement('p');
+        pirSymbol.classList.add('image-grid-pir-symbol');
+        pirSymbol.textContent = 'N/A';
+        bar.appendChild(pirSymbol);
+        // The cam secret symbol
+        let camSymbol = document.createElement('p');
+        camSymbol.classList.add('image-grid-cam-symbol');
+        camSymbol.textContent = 'N/A';
+        bar.appendChild(camSymbol);
+        // The signature symbol
+        let sigSymbol = document.createElement('p');
+        sigSymbol.classList.add('image-grid-sig-symbol');
+        sigSymbol.textContent = 'N/A';
+        bar.appendChild(sigSymbol);
+        // The img
+        let imgElement = new Image();
+        imgElement.src = '/test_icon_192.png';
+        imgElement.classList.add('image-grid-img');
+        cell.appendChild(imgElement);
+      }
+    }
+
+    function writeStorageStatus(usage, observedQuota, estimatedQuota) {
+      const bytesToStr = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MiB';
+      storageStatusP.textContent =
+        `Used: ${bytesToStr(usage)};\r\n` +
+        `Minimal Observed Quota: ${bytesToStr(observedQuota)};\r\n` +
+        `Estimated Quota (POSSIBLY INACCURATE): ${bytesToStr(estimatedQuota)}.`
+    }
+
+    function getMaxMinImgTimestampsInMem() {
+      var allImgTimestamps = Array.from(timedImages.keys());
+      var maxImgTimestamp = Math.max(...allImgTimestamps);
+      var minImgTimestamp = Math.min(...allImgTimestamps);
+      return [maxImgTimestamp, minImgTimestamp];
+    }
+
+    function getViewedEndStartTimestamps() {
+      var viewedEndTimestamp = currentTimestamp - (pageNum - 1) * imageGridSize;
+      var viewedStartTimestamp = viewedEndTimestamp - imageGridSize + 1;
+      return [viewedEndTimestamp, viewedStartTimestamp];
+    }
+
+    function regetMissingPhotos() {
+      // If viewing the 1st page, the latest few seconds of photos may not
+      // always be immediately available.
+      const shift = 5;
+
+      // Also reget the 60 seconds before and after the currently viewed photos.
+      const margin = 120;
+
+      var [viewedEndTimestamp, viewedStartTimestamp] = getViewedEndStartTimestamps();
+      var regetEndTimestamp = viewedEndTimestamp - shift + margin;
+      var regetStartTimestamp = viewedStartTimestamp - shift - margin;
+
+      _regetMissingPhotos(regetStartTimestamp, regetEndTimestamp);
+    }
+
+    async function _regetMissingPhotos(startTimestamp, endTimestamp) {
+      var timeWindow = [];
+      for (let i = startTimestamp; i < endTimestamp; i++)
+        timeWindow.push(i);
+
+      // Remove photo data from other time periods from the reget Map.
+      timedPhotoDataFromReget.forEach((value, key, map) => {
+        if (key < startTimestamp || key > endTimestamp)
+          timedPhotoDataFromReget.delete(key);
+      });
+
+      // Init the needed timestamps as those not in memory.
+      var allTimestampsInMem = Array.from(timedImages.keys())
+        .concat(Array.from(timedPhotoDataFromReget.keys()));
+      var needTimestamps = timeWindow.filter(t => !allTimestampsInMem.includes(t));
+
+      // Try getting missing photos from IndexedDB first.
+      var objectStore = getObjectStore('readonly');
+      var timestampsFromDB = [];
+      // Iterating backward because we are removing elements during the iteration.
+      for (let i = needTimestamps.length - 1; i >= 0; i--) {
+        let needTimestamp = needTimestamps[i];
+        await getPhotoDataFromDB(objectStore, needTimestamp)
+          .then((photoData) => {
+            // Bring back into a separate map in memory.
+            timedPhotoDataFromReget.set(needTimestamp, photoData);
+            needTimestamps.splice(i, 1);
+
+            timestampsFromDB.push(i);
+          })
+          .catch((error) => {});
+      }
+      logBoth(
+        `Re-acquired ${timestampsFromDB.length} image data from IndexedDB.`,
+        console.log
+      );
+
+      // Get the remaining missing photos from the server.
+      if (needTimestamps.length > 0) {
+        socket.emit('reget photos', JSON.stringify({'timestamps': needTimestamps}));
+        logBoth(`Regetting ${needTimestamps.length} image data from server.`, console.log);
+      }
+    }
+
+    function getObjectStore(mode) {
+      const dbTransaction = db.transaction(['PhotoData'], mode);
+      const objectStore = dbTransaction.objectStore('PhotoData');
+
+      dbTransaction.onerror = (event) => {
+        logBoth(
+          `Error when storing image data into IndexedDB. ` +
+          `The event is: ${event.target.error}`,
+          console.error
+        );
+      };
+
+      dbTransaction.onabort = handleDbTransactionOnAbort;
+
+      return objectStore;
+    }
+
+    async function handleDbTransactionOnAbort(event) {
+      const error = event.target.error;
+
+      // If quota is exceeded
+      if (error.name === 'QuotaExceededError') {
+        // Update the minimal observed quota.
+        var storageEstimate = await navigator.storage.estimate()
+        var currentObservedQuota = storageEstimate.usage;
+        if (currentObservedQuota < minDbObservedQuota) {
+          minDbObservedQuota = currentObservedQuota;
+          writeStorageStatus(
+            storageEstimate.usage,
+            minDbObservedQuota,
+            storageEstimate.quota
+          );
+        }
+
+        storageErrorsP.textContent =
+          `IndexedDB errors: Quota is exceeded with a ${error}.\r\n`
+
+        // Have to handle browser not updating quota after deletion.
+        // Otherwise, photo data will be deleted from IndexedDB very fast.
+        // Assuming 1 photo per second is received from server.
+        var secsAfterLastFreeUp = currentTimestamp - lastDbFreeUpTimestamp;
+        if (secsAfterLastFreeUp < minDbFreeUpInterval) {
+          storageErrorsP.textContent +=
+            `${lastDbFreeUpCount} photo data were deleted from IndexedDB ` +
+            `${secsAfterLastFreeUp} seconds ago.\r\nSo waiting for quota ` +
+            `to be updated and not freeing up again right now.`;
+        } else {
+          await freeUpDB();
+        }
+
+      // Other errors
+      } else {
+        storageErrorsP.textContent = `Unknown IndexedDB error: ${error}.\r\n`;
+      }
+      storageErrorsP.textContent += ` Time: ${new Date(currentTimestamp * 1000)}.`
+    }
+
+    function getPhotoDataFromDB(objectStore, timestamp) {
+      return new Promise((resolve, reject) => {
+        const dbRequest = objectStore.get(timestamp);
+        dbRequest.onsuccess = (event) => {
+          // Found in IndexedDB
+          if (event.target.result !== undefined) {
+            resolve(event.target.result);
+          // Not found in IndexedDB
+          } else {
+            reject(`Photo data with timestamp ${timestamp} was not found in IndexedDB.`);
+          }
+        }
+      });
+    }
+
+    function putPhotoDataIntoDB(objectStore, timestamp, photoData) {
+      return new Promise((resolve, reject) => {
+        const dbRequest = objectStore.put(photoData, timestamp);
+        dbRequest.onsuccess = (event) => { resolve(event); };
+        dbRequest.onerror = (event) => { reject(event); };
+
+        // Doesn't seem to catch QuotaExceededError here...
+        dbRequest.onabort = (event) => { reject(event); };
+      });
+    }
+
+    function delPhotoDataFromDB(objectStore, timestamp) {
+      return new Promise((resolve, reject) => {
+        const dbRequest = objectStore.delete(timestamp);
+        dbRequest.onsuccess = (event) => {
+          resolve();
+        };
+        dbRequest.onerror = (event) => {
+          reject(event);
+        };
+      });
+    }
+
+    function getAllKeysFromDB(objectStore) {
+      return new Promise((resolve, reject) => {
+        const dbRequest = objectStore.getAllKeys();
+        dbRequest.onsuccess = (event) => {
+          resolve(event);
+        };
+        dbRequest.onerror = (event) => {
+          reject(event);
+        };
+      });
+    }
+
+    // Free up IndexedDB by deleting old photos.
+    async function freeUpDB() {
+      const handleErrorsFromFreeingUp = (event) => {
+        storageErrorsP.textContent +=
+          `Error when trying to free up IndexedDB! This is unrecoverable. ` +
+          `The exact error is: ${event.target.error}.\r\n`
+      };
+
+      // Need a new DB transaction because the current one may have "auto-committed".
+      const newDbTransaction = db.transaction(['PhotoData'], 'readwrite');
+      const newObjectStore = newDbTransaction.objectStore('PhotoData');
+      const allTimestamps = await getAllKeysFromDB(newObjectStore)
+        .then((event) => event.target.result )
+        .catch(handleErrorsFromFreeingUp);
+
+      // Delete half of the photos in IndexedDB.
+      allTimestamps.sort();
+      var deletedTimestamps = [];
+      for (let i = 0; i < Math.round(allTimestamps.length / 2); i++) {
+        let timestamp = allTimestamps[i];
+        await delPhotoDataFromDB(newObjectStore, timestamp)
+          .then(() => { deletedTimestamps.push(timestamp); })
+          .catch(handleErrorsFromFreeingUp);
+      }
+
+      // Write to page.
+      storageFreeUpP.textContent =
+        `There were ${allTimestamps.length} photo data in IndexedDB.\r\n`;
+      storageFreeUpP.textContent +=
+        `Proceeded to delete ${deletedTimestamps.length} photo data from IndexedDB.\r\n`
+
+      lastDbFreeUpTimestamp = currentTimestamp;
+      lastDbFreeUpCount = deletedTimestamps.length;
+
+      return [deletedTimestamps.length, allTimestamps.length];
+    }
+
+    const clientStartTimestamp = Math.round((new Date()).getTime() / 1000);
+
+    const fullReloadButton = document.getElementById('full-reload');
+    const pirSecretP = document.getElementById('pir-secret');
+    const camSecretP = document.getElementById('cam-secret');
+    const pubkeyPemP = document.getElementById('pubkey-pem');
+    const photoCountsP = document.getElementById('photo-counts');
+    const storageStatusP = document.getElementById('storage-status');
+    const storageErrorsP = document.getElementById('storage-errors');
+    const storageFreeUpP = document.getElementById('storage-free-up');
+    const memoryStatusP = document.getElementById('memory-status');
+
+    // Define a color palette for CSS.
+    const GREEN = '#00dd00';
+    const RED = '#dd0000';
+    const BLUE = '#0000dd';
+    const YELLOW = '#dddd00';
+    const ORANGE = '#ff7f00';
+    const WHITE = '#ffffff';
+
+    fullReloadButton.addEventListener('click', async () => {
+      localStorage.clear();
+
+      const objectStore = getObjectStore('readwrite');
+      await objectStore.clear();
+
+      location.reload();
+    });
+
+    // Bootstrap data from the server
+    const bootstrapResp = await fetch('/server/bootstrap');
+    const bootstrapData = await bootstrapResp.json();
+    const serverStartTimestamp = bootstrapData['server_start_time'];
+    // Import and display server public key
+    pubkeyPemP.textContent =
+      `Server's public key in PEM format is:\r\n${bootstrapData['pubkey_pem']}`;
+    var pubkey = null;
+    try {
+      pubkey = await importPubKeyFromPEM(bootstrapData['pubkey_pem']);
+      pubkeyPemP.textContent += `The key algorithm is ${pubkey.algorithm.name}.`;
+    } catch (e) {
+      pubkeyPemP.textContent +=
+        `Your browser probably doesn\'t support ed25519 cryptography.\r\n` +
+        `The exact error is: ${e}`;
+      pubkeyPemP.style.color = 'red';
+    }
+    const clientConfig = bootstrapData['client_config'];
+
+    // Set a clock that ticks every second.
+    var currentTimestamp = clientStartTimestamp;
+    setInterval(function() {
+      var currentTime = new Date();
+      var currentTimestampMs = currentTime.getTime();
+      currentTimestamp = Math.round(currentTimestampMs / 1000);
+
+      // Write the time info to page.
+      var serverStartTime = new Date(serverStartTimestamp * 1000);
+      var clientStartTime = new Date(clientStartTimestamp * 1000);
+
+      document.getElementById('time').textContent =
+        `Current time: ${currentTime}\r\n\r\n` +
+        `Server start time: ${serverStartTime}\r\n` +
+        `Client start time: ${clientStartTime}\r\n\r\n`;
+    }, 1000);
+
+    // Socket.IO
+    const socket = io();
+
+    // IndexedDB
+    let db;
+    const dbRequest = window.indexedDB.open('PhotoDatabase', 3);
+    dbRequest.onerror = (event) => {
+      logBoth(
+        `Error when opening IndexedDB. The event is: ${event.target.result}`,
+        console.error
+      );
+    };
+    dbRequest.onsuccess = (event) => {
+      logBoth(
+        `Successfully opened IndexedDB. The event is: ${event.target.result}`,
+        console.log
+      );
+      db = dbRequest.result;
+    };
+    dbRequest.onupgradeneeded = (event) => {
+      db = event.target.result;
+
+      db.onerror = (event) => {
+        logBoth(`Database error: ${event.target.error?.message}`);
+      };
+
+      const objectStore = db.createObjectStore('PhotoData');
+      objectStore.createIndex('photoBase64', 'photoBase64');
+      objectStore.createIndex('sigVeri', 'sigVeri');
+      logBoth('The object store is created in IndexedDB.', console.log);
+    };
+
+    // IndexedDB states
+    var minDbObservedQuota = (await navigator.storage.estimate()).quota;
+    var lastDbFreeUpTimestamp = clientStartTimestamp;
+    var lastDbFreeUpCount = 0;  // Currently only for informational purpose.
+    const minDbFreeUpInterval = 60;
+    // Disabling IndexedDB
+    const disableIndexedDbCheckbox = document.getElementById('disable-indexeddb');
+    if (window.chrome)
+      disableIndexedDbCheckbox.checked = true;
+    else
+      disableIndexedDbCheckbox.checked = false;
+    var isIndexedDbDisabled = disableIndexedDbCheckbox.checked;
+    disableIndexedDbCheckbox.addEventListener('change', (event) => {
+      isIndexedDbDisabled = event.currentTarget.checked;
+    });
+
+
+    // Handle incoming secrets.
+    // On the client, the values first received for the secrets
+    // are considered the correct values.
+    // Need a separate bool to indicate if a secret has ever been bad.
+    // If it has, then even if the correct value is somehow received
+    // later on, it's still considered detection.
+    var wasPirSecretBad = null;
+    var lastGoodPirSecretTimeMs = null;
+    var wasCamSecretBad = null;
+    var lastGoodCamSecretTimeMs = null;
+    var lastSecretRecvTimeMs = null;
+    socket.on('secrets broadcast', (secretsJson) => {
+      // Note: All values in local storage are strings!
+      const storedPirSecretStr = localStorage.getItem('pirSecret');
+      const storedCamSecretStr = localStorage.getItem('camSecret');
+      lastSecretRecvTimeMs = Date.now();
+      // Initialize the secret on first reception.
+      if (storedPirSecretStr === null) {
+        localStorage.setItem('pirSecret', secretsJson['pir']);
+        wasPirSecretBad = false;
+        lastGoodPirSecretTimeMs = lastSecretRecvTimeMs;
+      // On later receptions, check if they mismatch.
+      } else {
+        // Don't recover if the secret has been bad.
+        if (wasPirSecretBad !== true) {
+          // TODO: Handle secrets made with words.
+          wasPirSecretBad = parseInt(storedPirSecretStr, 10) !== secretsJson['pir'];
+          if (wasPirSecretBad === false) {
+            lastGoodPirSecretTimeMs = lastSecretRecvTimeMs;
+          }
+        }
+      }
+      // Do the same for the cam secret.
+      if (storedCamSecretStr === null) {
+        localStorage.setItem('camSecret', secretsJson['cam']);
+        wasCamSecretBad = false;
+        lastGoodCamSecretTimeMs = lastSecretRecvTimeMs;
+      } else {
+        if (wasCamSecretBad !== true) {
+          // TODO: Handle secrets made with words.
+          wasCamSecretBad = parseInt(storedCamSecretStr, 10) !== secretsJson['cam'];
+          if (wasCamSecretBad === false) {
+            lastGoodCamSecretTimeMs = lastSecretRecvTimeMs;
+          }
+        }
+        // TODO: Show whatever is received regardless.
+        //       Can't just assign to camSecret directly, because if a null
+        //       is received, then the states are reset.
+      }
+
+      // Show the secrets.
+      pirSecretP.textContent =
+        `PIR: Stored: ${storedPirSecretStr}; Received: ${secretsJson['pir']};\r\n` +
+        `Time of last attestation: ${new Date(lastGoodPirSecretTimeMs)}.`;
+      if (wasPirSecretBad === true)
+        pirSecretP.style.color = 'red';
+      camSecretP.textContent =
+        `Cam: Stored: ${storedCamSecretStr}; Received: ${secretsJson['cam']};\r\n` +
+        `Time of last attestation: ${new Date(lastGoodCamSecretTimeMs)}.`;
+      if (wasCamSecretBad === true)
+        camSecretP.style.color = 'red';
+      var content = '';
+      var lastGoodPirSecretTimeStr = new Date(lastGoodPirSecretTimeMs).toTimeString();
+      var lastGoodCamSecretTimeStr = new Date(lastGoodCamSecretTimeMs).toTimeString();
+    });
+    // Keep checking if we've been receiving secrets.
+    // Log if there are discontinuity.
+    //
+    // Keep a log as an array of pairs recording the start and end times of
+    // each discontinuity, i.e. a duration when secrets are not being received.
+    // A pair of (startTime, null) is appended to the array when each
+    // discontinuity starts. Then the null is replaced with the end
+    // time when the latest discontinuity stops.
+    var secretsDiscontLog = [];
+    // The longest time allowed for not receiving the latest secret before
+    // entering a discontinuity, in seconds.
+    const contTimeLimit = 3;
+    setInterval(function() {
+      var currentTimeMs = Date.now();
+      var currentTime = Math.round(currentTimeMs / 1000);
+      var elapsedSecs = Math.round((currentTimeMs - lastSecretRecvTimeMs) / 1000);
+
+      // Let the end time in the last pair (or whether the log is empty) indicate 
+      // whether we are in the middle of a discontinuity, instead of using an
+      // additional bool var.
+      var isInDiscont = secretsDiscontLog.length > 0 ?
+        secretsDiscontLog[secretsDiscontLog.length - 1][1] === null :
+        false;
+        
+      // Update the log if necessary.
+      // FIXME: A race condition between receiving the first secrets and
+      //        the start of this script.
+      if (elapsedSecs > contTimeLimit) {
+        if (!isInDiscont) {
+          secretsDiscontLog.push([currentTime - contTimeLimit, null]);
+        }
+      } else {
+        if (isInDiscont) {
+          secretsDiscontLog[secretsDiscontLog.length - 1][1] = currentTime;
+        }
+      }
+
+      // Update the log UI.
+      var logContent = '';
+      for (let i = 0; i < secretsDiscontLog.length; i++) {
+        let pair = secretsDiscontLog[i];
+        let startDateTimeStr = new Date(pair[0] * 1000).toString();
+        let endDateTimeStr = pair[1] !== null ?
+          (new Date(pair[1] * 1000)).toString() :
+          'On-going';
+
+        logContent += 'Start: ' + startDateTimeStr + ', End: ' + endDateTimeStr + '<br>';
+
+        document.getElementById('secrets-discontinuity-log-p').innerHTML = logContent;
+      }
+    }, 1000);
+
+    // Handle incoming images.
+    var timedImages = new Map();
+    // A separate map for photo data re-acquired from server,
+    // because if these are stored directly into the same `timedImages`, its size
+    // may exceed the threshold and cause them to be stored into IndexedDB or
+    // even removed directly.
+    var timedPhotoDataFromReget = new Map();
+    socket.on('image broadcast', async (imageDataJson) => {
+      // The unit of the received timestamp is seconds, with values after
+      // the decimal point. Using `floor` here so that the date time string
+      // that's generated later will align with the one generated on server,
+      // because server uses `strftime` and discards the milliseconds part.
+      // This is critical for signature verification!
+      var imgTimestamp = Math.floor(imageDataJson['timestamp']);
+      var imgB64 = imageDataJson['image_b64'];
+      var imgBytes = base64ToUint8Array(imgB64).buffer;
+      // If there is a signature, verify it once when it's received and attach
+      // the verification result, instead of verifying repeatedly
+      // in other loops.
+      var sigVeri = null;
+      var sigB64 = 'sig_b64' in imageDataJson ? imageDataJson['sig_b64'] : null;
+      if (sigB64 === null) {
+        sigVeri = SIGVERI_NO_SIG;
+      } else {
+        // Handle if browser doesn't support ed25519.
+        if (pubkey === null) {
+          sigVeri = SIGVERI_UNSUPPORTED;
+        } else {
+          var sigBytes = base64ToUint8Array(sigB64).buffer;
+          var imgDateTimeStr = timestampMsToDateTimeStr(imgTimestamp * 1000);
+          var imgHash = await window.crypto.subtle.digest('SHA-256', imgBytes);
+          var imgHashHex =
+            [...new Uint8Array(imgHash)].map(
+              x => x.toString(16).padStart(2, '0')
+            ).join('');
+          var signedStr = imgDateTimeStr + ',' + imgHashHex;
+          var result = await window.crypto.subtle.verify(
+            { 'name': 'Ed25519' },
+            pubkey,
+            sigBytes,
+            new TextEncoder().encode(signedStr)
+          );
+          if (result === false) {
+            sigVeri = SIGVERI_BAD_SIG;
+          } else if (result === true) {
+            sigVeri = SIGVERI_GOOD_SIG;
+          }
+        }
+      }
+      const newPhotoData = new PhotoData(imgB64, sigVeri);
+      if (!imageDataJson.hasOwnProperty('reget')) {
+        console.error(
+          `The received photo data with timestamp ${imgTimestamp} has no "reget" field.`
+        );
+      } else if (imageDataJson['reget'] === false) {
+        timedImages.set(imgTimestamp, newPhotoData);
+      } else if (imageDataJson['reget'] === true) {
+        timedPhotoDataFromReget.set(imgTimestamp, newPhotoData);
+      }
+
+      // Update the photo counts text.
+      var objectStore = getObjectStore('readonly');
+      const totalNumPhotosInMem = timedImages.size + timedPhotoDataFromReget.size;
+      const allTimestampsInDb = (await getAllKeysFromDB(objectStore)).target.result;
+      const numPhotosInDb = allTimestampsInDb.length;
+      const totalNumPhotos = totalNumPhotosInMem + numPhotosInDb;
+      photoCountsP.textContent = 
+        `Number of photos in memory: ${timedImages.size} + ` +
+        `${timedPhotoDataFromReget.size} = ${totalNumPhotosInMem}\r\n` +
+        `Number of photos in IndexedDB: ${numPhotosInDb}\r\n` +
+        `Total number of photos stored in the browser: ${totalNumPhotos}`
+
+      const estimatedMemUsageStr =
+        (newPhotoData.getSizeInBytes() * totalNumPhotosInMem / 1024 / 1024).toFixed(1) + ' MiB';
+      memoryStatusP.textContent =
+        `Estimated memory usage by photos: ${estimatedMemUsageStr}.`
+
+      // If `timedImages` gets too big in the memory, it may crash the page!
+      // So store old images in IndexedDB.
+      if (timedImages.size > clientConfig['MAX_NUM_PHOTOS_IN_MEM']) {
+        // But first check if IndexedDB is almost full.
+        var shouldStoreInDb = true;  // Only store if it's <80% full.
+        var storageEstimate = await navigator.storage.estimate();
+        if (storageEstimate.usage / minDbObservedQuota > 0.8) {
+          shouldStoreInDb = false;
+
+          storageErrorsP.textContent = 'IndexedDB is more than 80% full.';
+
+          // Have to handle browser not updating quota right after deletion.
+          // Otherwise, photo data will be deleted from IndexedDB very fast.
+          // Assuming 1 photo per second is received from server.
+          var secsAfterLastFreeUp = currentTimestamp - lastDbFreeUpTimestamp;
+          if (secsAfterLastFreeUp < minDbFreeUpInterval) {
+            storageErrorsP.textContent +=
+              `${lastDbFreeUpCount} photo data were deleted from IndexedDB ` +
+              `${secsAfterLastFreeUp} seconds ago.\r\nSo waiting for quota ` +
+              `to be updated and not freeing up again right now and not ` +
+              `storing photo data from memory into IndexedDB right now.`;
+          } else {
+            await freeUpDB();
+          }
+        }
+
+        // Either store old photo data into IndexedDB or simply remove them,
+        // based on previous check of whether IndexedDB is almost full.
+        objectStore = getObjectStore('readwrite');
+        var [maxImgTimestampInMem, minImgTimestampInMem] = getMaxMinImgTimestampsInMem();
+        var movedImgTimestamps = [];
+        for (
+          let t = minImgTimestampInMem;
+          t < t + clientConfig['SECS_PHOTOS_TO_MOVE_TO_FREE_MEM'];
+          t++
+        ) {
+          // Don't move the photo from the memory to IndexedDB if it's in view.
+          //let [viewedEndTimestamp, viewedStartTimestamp] = getViewedEndStartTimestamps();
+          //if (t <= viewedEndTimestamp && t >= viewedStartTimestamp)
+          //  continue;
+
+          // If IndexedDB is disabled or almost full,
+          // simply remove the photo data from memory.
+          if (isIndexedDbDisabled === true || shouldStoreInDb === false) {
+            timedImages.delete(t);
+            movedImgTimestamps.push(t);
+          } else {
+            // Otherwise, move it from the memory to IndexedDB.
+            let photoData = timedImages.get(t);
+            await putPhotoDataIntoDB(objectStore, t, photoData)
+              .then((event) => {  
+                timedImages.delete(t);
+                movedImgTimestamps.push(t);
+              })
+              .catch((event) => {
+                logBoth(event, console.error);
+              });
+          }
+        }
+        console.log(`Move/removed ${movedImgTimestamps.length} photo data from memory.`);
+      }
+
+      // Show IndexedDB usage and quota.
+      var storageEstimate = await navigator.storage.estimate();
+      writeStorageStatus(storageEstimate.usage, minDbObservedQuota, storageEstimate.quota);
+    });
+
+    // Pre-fill the image stream div with img elements.
+    const imageGrid = document.getElementById('image-grid');
+    // The size is initialized to have 1 minute worth of photos.
+    // But it can be changed with the photo time range control.
+    var imageGridSize = 60;
+    addImageCells(imageGrid, imageGridSize, 'append');
+
+    // Pagination control
+    // Page number
+    var pageNum = 1;
+    const pageNumInput = document.getElementById('page-num-input');
+    const pageNumButton = document.getElementById('page-num-button');
+    pageNumButton.onclick = () => {
+      var pageNum_ = parseInt(pageNumInput.value);
+      if (isNaN(pageNum_)) { return; }
+      pageNum = pageNum_;
+
+      regetMissingPhotos();
+    }
+    // Prev/next page
+    const prevPageButton = document.getElementById('photo-log-prev-button');
+    const nextPageButton = document.getElementById('photo-log-next-button');
+    prevPageButton.onclick = () => { pageNum--; regetMissingPhotos(); }
+    nextPageButton.onclick = () => { pageNum++; regetMissingPhotos(); }
+    // Photos per page
+    const photosPerPageSel = document.getElementById('photos-per-page-sel');
+    photosPerPageSel.value = imageGridSize;
+    // Add/remove cells to the image grid based on the selected photos per page.
+    photosPerPageSel.onchange = () => {
+      var input = parseInt(photosPerPageSel.value);
+      if (input > imageGridSize) {
+        addImageCells(imageGrid, input - imageGridSize, 'append');
+      } else if (input < imageGridSize) {
+        for (let i = 0; i < imageGridSize - input; i++) {
+          // Re-acquire the image cells before every removal.
+          var imgCells = document.getElementsByClassName('image-grid-cell');
+          imgCells.item(0).remove();
+        }
+      }
+      imageGridSize = input;
+    }
+
+    // Keep updating the image grid every second.
+    setInterval(async function() {
+      // The number of image cells may be dynamic. So recollect them each iteration.
+      var imgCells = document.getElementsByClassName('image-grid-cell');
+
+      const objectStore = getObjectStore('readonly');
+
+      for (let i = 0; i < imageGridSize; i++) {
+        var cell = imgCells.item(i);
+        var datetimeP = cell.getElementsByClassName('image-grid-datetime-p')[0];
+        var sourceP = cell.getElementsByClassName('image-grid-source-p')[0];
+        var pirSymbol = cell.getElementsByClassName('image-grid-pir-symbol')[0];
+        var camSymbol = cell.getElementsByClassName('image-grid-cam-symbol')[0];
+        var sigSymbol = cell.getElementsByClassName('image-grid-sig-symbol')[0];
+        var imgElement = cell.getElementsByClassName('image-grid-img')[0];
+        var imgTimestamp = currentTimestamp - i - (pageNum - 1) * imageGridSize;
+        var imgTimestampMs = imgTimestamp * 1000;
+
+        let timedImage = null;
+        // Try getting the photo data from the main Map in memory first.
+        if (timedImages.has(imgTimestamp)) {
+          timedImage = timedImages.get(imgTimestamp);
+          sourceP.textContent = 'MEM';
+        } else {
+          // Then try to get it from IndexedDB.
+          var gotFromDB = false;
+          await getPhotoDataFromDB(objectStore, imgTimestamp)
+            .then((photoData) => {
+              timedImage = photoData;
+              sourceP.textContent = 'DB';
+              gotFromDB = true;
+            })
+            .catch((error) => {
+              console.debug(error);
+            });
+          // Finally, try to see if it has been re-acquired.
+          if (gotFromDB === false) {
+            if (timedPhotoDataFromReget.has(imgTimestamp)) {
+              timedImage = timedPhotoDataFromReget.get(imgTimestamp);
+              sourceP.textContent = 'REGET';
+            }
+          }
+        }
+        if (timedImage === null) {
+          imgElement.src = '/test_icon_192.png';
+          continue;
+        }
+        
+        let imgB64 = timedImage.photoBase64;
+        imgElement.src = 'data:image/jpeg;base64,' + imgB64;
+
+        // Build the date time string.
+        let imgDateTimeStr = timestampMsToDateTimeStr(imgTimestampMs);
+        let imgTimezoneOffsetHours = new Date(imgTimestampMs).getTimezoneOffset() / 60;
+        // The +/- sign is inversed.
+        let imgTimezoneSymbol = imgTimezoneOffsetHours > 0 ? '-' : '+';
+        let imgTimezoneStr = 'UTC' + imgTimezoneSymbol + imgTimezoneOffsetHours;
+        imgDateTimeStr += ' ' + imgTimezoneStr;
+        datetimeP.textContent = imgDateTimeStr;
+
+        // Mark the secrets symbols.
+        const markSecretSymbol =
+          (htmlElement, symbolName, lastGoodSecretTimeMs, wasSecretBad) => {
+
+          if (lastGoodSecretTimeMs !== null) {
+            if (imgTimestampMs < lastGoodSecretTimeMs) {
+              htmlElement.textContent = symbolName;
+              htmlElement.style.background = GREEN;
+            } else {
+              if (wasSecretBad === true) {
+                htmlElement.textContent = `BAD ${symbolName}`;
+                htmlElement.style.background = RED;
+              // Sometimes the secret may arrive later than the photo,
+              // especially for the first few photos.
+              } else {
+                htmlElement.textContent = `?${symbolName}?`;
+                htmlElement.style.background = YELLOW;
+              }
+            }
+          }
+        };
+        markSecretSymbol(pirSymbol, 'PIR', lastGoodPirSecretTimeMs, wasPirSecretBad);
+        markSecretSymbol(camSymbol, 'Cam', lastGoodCamSecretTimeMs, wasCamSecretBad);
+
+        // Mark the signature symbol.
+        sigSymbol.textContent = timedImage.sigVeri;
+        const sigVeriToColor = new Map([
+          [SIGVERI_UNSUPPORTED, ORANGE],
+          [SIGVERI_NO_SIG, WHITE],
+          [SIGVERI_BAD_SIG, RED],
+          [SIGVERI_GOOD_SIG, BLUE]
+        ]);
+        sigSymbol.style.background = sigVeriToColor.get(timedImage.sigVeri);
+      }
+    }, 1000);
+
+    // Photos time range control
+    const photosTimeRangeStartInput = document.getElementById('photos-time-range-start-input');
+    const photosTimeRangeEndInput = document.getElementById('photos-time-range-end-input');
+    const photosTimeRangeLog = document.getElementById('photos-time-range-log');
+    document.getElementById('photos-time-range-confirm-button').onclick = () => {
+      var startMinuteInput = photosTimeRangeStartInput.value;
+      var endMinuteInput = photosTimeRangeEndInput.value;
+      // TODO: parseInt allows trailing non-digits..
+      var startMinute = parseInt(startMinuteInput);
+      var endMinute = parseInt(endMinuteInput);
+      if (
+        (startMinuteInput !== '' && isNaN(startMinute)) ||
+        (endMinuteInput !== '' && isNaN(endMinute))
+      ) {
+        photosTimeRangeLog.textContent = 'Please input only integers.';
+        return;
+      } else if (startMinute >= endMinute) {
+        photosTimeRangeLog.textContent = 'The start must be before the end.';
+        return;
+      } else if (endMinute - startMinute > 60 * 24 * 2) {
+        photosTimeRangeLog.textContent = 'The interval must be shorter than 2 days.';
+        return;
+      }
+      photosTimeRangeLog.textContent = '';
+
+      var currentTimestamp = Math.round((new Date()).getTime() / 1000);
+
+      // A blank start input means to start from the beginning.
+      // TODO: Use server start time instead of client's.
+      photoStartSec = startMinuteInput !== '' ?
+        clientStartTimestamp + startMinute * 60 : clientStartTimestamp;
+      // A blank end input however, means to always show the latest.
+      // That is, the end time needs to be dynamically updated to the latest.
+      // So reset photoEndSec to null to reflect this.
+      photoEndSec = endMinuteInput !== '' ?
+        clientStartTimestamp + endMinute * 60 : null;
+      // Reset the visible range and swap count.
+      photoVisibleEndSec = photoEndSec ?? currentTimestamp;
+      photoVisibleStartSec = photoEndSec - imageGridSize + 1;
+      swapCount = 0;
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+{
+	acme_dns {$TRIPWIRE_DOM_REG} {env.TRIPWIRE_DOM_REG_TOK}
+
+	dynamic_dns {
+		provider {$TRIPWIRE_DOM_REG} {env.TRIPWIRE_DOM_REG_TOK}
+		domains {
+			{$TRIPWIRE_DOM}
+		}
+		check_interval 2m
+		versions ipv4
+		ttl 1h
+	}
+	log {
+		level DEBUG
+	}
+}
+
+{$TRIPWIRE_DOM} {
+	handle_path /server/* {
+		reverse_proxy :8000
+	}
+
+	handle /socket.io/* {
+		reverse_proxy :8000
+	}
+
+	handle {
+		root * /home/pi/tripwire/client/
+		file_server
+	}
+
+	basic_auth {
+		{$TRIPWIRE_USER} {$TRIPWIRE_PW}
+	}
+}
