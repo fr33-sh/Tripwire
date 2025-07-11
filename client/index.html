@@ -24,8 +24,14 @@
   <!-- IOS requires user interaction before asking for permission. -->
   <button id="enable-push">Enable Push Notification</button>
 
+  <!-- The arm button. -->
+  <button id="arm">Arm</button>
+
   <!-- A button for reloading the page. -->
   <button id="full-reload">Full Reload</button>
+
+  <!-- Arm status -->
+  <p id="arm-status">Please arm Tripwire when you are ready.</p>
 
   <!-- The sensor secrets. -->
   <h2>Secrets</h2>
@@ -100,6 +106,16 @@
       <option value=1200>1200</option>
     </select>
     <p id="photos-time-range-log"></p>
+
+    <button id="reget-button">Re-acquire Missing Photos</button>
+    <button id="freeze-button">Freeze</button>
+    <br><br>
+
+    <span>Filters:</span>
+    <input type="checkbox" id="filter-good-sig" name="filter-good-sig">
+    <label for="filter-good-sig">Good Sig</label>
+    <input type="checkbox" id="filter-bad-sig" name="filter-bad-sig">
+    <label for="filter-bad-sig">Bad Sig</label>
   </div>
 
   <!-- A grid showing a stream of pictures from the camera. -->
@@ -419,7 +435,9 @@
 
     const clientStartTimestamp = Math.round((new Date()).getTime() / 1000);
 
+    const armButton = document.getElementById('arm');
     const fullReloadButton = document.getElementById('full-reload');
+    const armedStatusP = document.getElementById('arm-status');
     const pirSecretP = document.getElementById('pir-secret');
     const camSecretP = document.getElementById('cam-secret');
     const pubkeyPemP = document.getElementById('pubkey-pem');
@@ -437,6 +455,16 @@
     const ORANGE = '#ff7f00';
     const WHITE = '#ffffff';
 
+    var armedTime = null;
+    armButton.addEventListener('click', async () => {
+      const armResp = await fetch('/server/arm');
+      const armData = await armResp.text();
+      armedStatusP.textContent = armData;
+      armButton.disabled = true;
+
+      armedTime = new Date();
+    });
+
     fullReloadButton.addEventListener('click', async () => {
       localStorage.clear();
 
@@ -446,10 +474,14 @@
       location.reload();
     });
 
+    // Filters
+    const filterGoodSigCheck = document.getElementById('filter-good-sig');
+    const filterBadSigCheck = document.getElementById('filter-bad-sig');
+    // TODO: Disable the opposite checkbox when one is clicked.
+
     // Bootstrap data from the server
     const bootstrapResp = await fetch('/server/bootstrap');
     const bootstrapData = await bootstrapResp.json();
-    const serverStartTimestamp = bootstrapData['server_start_time'];
     // Import and display server public key
     pubkeyPemP.textContent =
       `Server's public key in PEM format is:\r\n${bootstrapData['pubkey_pem']}`;
@@ -473,13 +505,12 @@
       currentTimestamp = Math.round(currentTimestampMs / 1000);
 
       // Write the time info to page.
-      var serverStartTime = new Date(serverStartTimestamp * 1000);
-      var clientStartTime = new Date(clientStartTimestamp * 1000);
+      var armedTimeStr = armedTime !== null ? armedTime.toString() :
+        "Tripwire isn't armed yet.";
 
       document.getElementById('time').textContent =
         `Current time: ${currentTime}\r\n\r\n` +
-        `Server start time: ${serverStartTime}\r\n` +
-        `Client start time: ${clientStartTime}\r\n\r\n`;
+        `Armed time: ${armedTimeStr}`;
     }, 1000);
 
     // Socket.IO
@@ -814,8 +845,22 @@
     // Prev/next page
     const prevPageButton = document.getElementById('photo-log-prev-button');
     const nextPageButton = document.getElementById('photo-log-next-button');
-    prevPageButton.onclick = () => { pageNum--; regetMissingPhotos(); }
-    nextPageButton.onclick = () => { pageNum++; regetMissingPhotos(); }
+    const regetButton = document.getElementById('reget-button');
+    const freezeButton = document.getElementById('freeze-button');
+    prevPageButton.addEventListener('click', () => { pageNum--; regetMissingPhotos(); });
+    nextPageButton.addEventListener('click', () => { pageNum++; regetMissingPhotos(); });
+    regetButton.addEventListener('click', () => { regetMissingPhotos(); });
+    // Freeze / unfreeze
+    var freezeTimestamp = null;
+    freezeButton.addEventListener('click', () => {
+      if (freezeTimestamp === null) {
+        freezeTimestamp = currentTimestamp;
+        freezeButton.textContent = "Unfreeze";
+      } else {
+        freezeTimestamp = null;
+        freezeButton.textContent = "Freeze";
+      }
+    });
     // Photos per page
     const photosPerPageSel = document.getElementById('photos-per-page-sel');
     photosPerPageSel.value = imageGridSize;
@@ -836,70 +881,44 @@
 
     // Keep updating the image grid every second.
     setInterval(async function() {
-      // The number of image cells may be dynamic. So recollect them each iteration.
-      var imgCells = document.getElementsByClassName('image-grid-cell');
 
-      const objectStore = getObjectStore('readonly');
+      const getCellElements = (cell) => {
+        let datetimeP = cell.getElementsByClassName('image-grid-datetime-p')[0];
+        let sourceP = cell.getElementsByClassName('image-grid-source-p')[0];
+        let pirSymbol = cell.getElementsByClassName('image-grid-pir-symbol')[0];
+        let camSymbol = cell.getElementsByClassName('image-grid-cam-symbol')[0];
+        let sigSymbol = cell.getElementsByClassName('image-grid-sig-symbol')[0];
+        let imgElement = cell.getElementsByClassName('image-grid-img')[0];
 
-      for (let i = 0; i < imageGridSize; i++) {
-        var cell = imgCells.item(i);
-        var datetimeP = cell.getElementsByClassName('image-grid-datetime-p')[0];
-        var sourceP = cell.getElementsByClassName('image-grid-source-p')[0];
-        var pirSymbol = cell.getElementsByClassName('image-grid-pir-symbol')[0];
-        var camSymbol = cell.getElementsByClassName('image-grid-cam-symbol')[0];
-        var sigSymbol = cell.getElementsByClassName('image-grid-sig-symbol')[0];
-        var imgElement = cell.getElementsByClassName('image-grid-img')[0];
-        var imgTimestamp = currentTimestamp - i - (pageNum - 1) * imageGridSize;
-        var imgTimestampMs = imgTimestamp * 1000;
-
-        let timedImage = null;
-        // Try getting the photo data from the main Map in memory first.
-        if (timedImages.has(imgTimestamp)) {
-          timedImage = timedImages.get(imgTimestamp);
-          sourceP.textContent = 'MEM';
-        } else {
-          // Then try to get it from IndexedDB.
-          var gotFromDB = false;
-          await getPhotoDataFromDB(objectStore, imgTimestamp)
-            .then((photoData) => {
-              timedImage = photoData;
-              sourceP.textContent = 'DB';
-              gotFromDB = true;
-            })
-            .catch((error) => {
-              console.debug(error);
-            });
-          // Finally, try to see if it has been re-acquired.
-          if (gotFromDB === false) {
-            if (timedPhotoDataFromReget.has(imgTimestamp)) {
-              timedImage = timedPhotoDataFromReget.get(imgTimestamp);
-              sourceP.textContent = 'REGET';
-            }
-          }
+        return {
+          datetimeP: datetimeP,
+          sourceP: sourceP,
+          pirSymbol: pirSymbol,
+          camSymbol: camSymbol,
+          sigSymbol: sigSymbol,
+          imgElement: imgElement
         }
-        if (timedImage === null) {
-          imgElement.src = '/test_icon_192.png';
-          continue;
-        }
-        
-        let imgB64 = timedImage.photoBase64;
-        imgElement.src = 'data:image/jpeg;base64,' + imgB64;
+      };
+
+      const drawCell = (cellElements, photoData, photoTimestampMs) => {
+        let imgB64 = photoData.photoBase64;
+        cellElements.imgElement.src = 'data:image/jpeg;base64,' + imgB64;
 
         // Build the date time string.
-        let imgDateTimeStr = timestampMsToDateTimeStr(imgTimestampMs);
-        let imgTimezoneOffsetHours = new Date(imgTimestampMs).getTimezoneOffset() / 60;
+        let photoDateTimeStr = timestampMsToDateTimeStr(photoTimestampMs);
+        let photoTimezoneOffsetHours = new Date(photoTimestampMs).getTimezoneOffset() / 60;
         // The +/- sign is inversed.
-        let imgTimezoneSymbol = imgTimezoneOffsetHours > 0 ? '-' : '+';
-        let imgTimezoneStr = 'UTC' + imgTimezoneSymbol + imgTimezoneOffsetHours;
-        imgDateTimeStr += ' ' + imgTimezoneStr;
-        datetimeP.textContent = imgDateTimeStr;
+        let photoTimezoneSymbol = photoTimezoneOffsetHours > 0 ? '-' : '+';
+        let photoTimezoneStr = 'UTC' + photoTimezoneSymbol + photoTimezoneOffsetHours;
+        photoDateTimeStr += ' ' + photoTimezoneStr;
+        cellElements.datetimeP.textContent = photoDateTimeStr;
 
         // Mark the secrets symbols.
         const markSecretSymbol =
           (htmlElement, symbolName, lastGoodSecretTimeMs, wasSecretBad) => {
 
           if (lastGoodSecretTimeMs !== null) {
-            if (imgTimestampMs < lastGoodSecretTimeMs) {
+            if (photoTimestampMs < lastGoodSecretTimeMs) {
               htmlElement.textContent = symbolName;
               htmlElement.style.background = GREEN;
             } else {
@@ -915,18 +934,102 @@
             }
           }
         };
-        markSecretSymbol(pirSymbol, 'PIR', lastGoodPirSecretTimeMs, wasPirSecretBad);
-        markSecretSymbol(camSymbol, 'Cam', lastGoodCamSecretTimeMs, wasCamSecretBad);
+        markSecretSymbol(cellElements.pirSymbol, 'PIR', lastGoodPirSecretTimeMs, wasPirSecretBad);
+        markSecretSymbol(cellElements.camSymbol, 'Cam', lastGoodCamSecretTimeMs, wasCamSecretBad);
 
         // Mark the signature symbol.
-        sigSymbol.textContent = timedImage.sigVeri;
+        cellElements.sigSymbol.textContent = photoData.sigVeri;
         const sigVeriToColor = new Map([
           [SIGVERI_UNSUPPORTED, ORANGE],
           [SIGVERI_NO_SIG, WHITE],
           [SIGVERI_BAD_SIG, RED],
           [SIGVERI_GOOD_SIG, BLUE]
         ]);
-        sigSymbol.style.background = sigVeriToColor.get(timedImage.sigVeri);
+        cellElements.sigSymbol.style.background = sigVeriToColor.get(photoData.sigVeri);
+      };
+
+      // The number of image cells may be dynamic. So recollect them each iteration.
+      let imgCells = document.getElementsByClassName('image-grid-cell');
+
+      const objectStore = getObjectStore('readonly');
+
+      // If any filter is on, the display logic is different.
+      let isAnyFilterOn = filterGoodSigCheck.checked ||
+        filterBadSigCheck.checked;
+
+      if (isAnyFilterOn === true) {
+        // A map from timestamp to PhotoData.
+        let filteredPhotoData = new Map();
+        timedImages.forEach((v, k, _) => {
+          let isSigMatched =
+            (filterGoodSigCheck.checked === true && v.sigVeri === SIGVERI_GOOD_SIG) ||
+            (filterBadSigCheck.checked === true && v.sigVeri === SIGVERI_BAD_SIG);
+
+          if (isSigMatched === true) {
+            filteredPhotoData.set(k, v);
+          }
+        });
+
+        // An array of pairs of timestamp and PhotoData.
+        let sortedPhotoData =
+          [...filteredPhotoData.entries()].sort().reverse();
+
+        for (let i = 0; i < imageGridSize; i++) {
+          let cell = imgCells.item(i);
+          let cellElements = getCellElements(cell);
+
+          let photoDataIndex = (pageNum - 1) * imageGridSize + i;
+          if (photoDataIndex > sortedPhotoData.length - 1) {
+            cellElements.imgElement.src = '/test_icon_192.png';
+            continue;
+          }
+          let photoTimestampMs = sortedPhotoData[photoDataIndex][0] * 1000;
+          let photoData = sortedPhotoData[photoDataIndex][1];
+
+          drawCell(cellElements, photoData, photoTimestampMs);
+        }
+      } else {
+        for (let i = 0; i < imageGridSize; i++) {
+          let cell = imgCells.item(i);
+          let cellElements = getCellElements(cell);
+
+          let firstImgTimestamp = freezeTimestamp === null ?
+            currentTimestamp : freezeTimestamp;
+          let imgTimestamp = firstImgTimestamp - i - (pageNum - 1) * imageGridSize;
+          let imgTimestampMs = imgTimestamp * 1000;
+
+          let timedImage = null;
+          // Try getting the photo data from the main Map in memory first.
+          if (timedImages.has(imgTimestamp)) {
+            timedImage = timedImages.get(imgTimestamp);
+            cellElements.sourceP.textContent = 'MEM';
+          } else {
+            // Then try to get it from IndexedDB.
+            let gotFromDB = false;
+            await getPhotoDataFromDB(objectStore, imgTimestamp)
+              .then((photoData) => {
+                timedImage = photoData;
+                cellElements.sourceP.textContent = 'DB';
+                gotFromDB = true;
+              })
+              .catch((error) => {
+                console.debug(error);
+              });
+            // Finally, try to see if it has been re-acquired.
+            if (gotFromDB === false) {
+              if (timedPhotoDataFromReget.has(imgTimestamp)) {
+                timedImage = timedPhotoDataFromReget.get(imgTimestamp);
+                cellElements.sourceP.textContent = 'REGET';
+              }
+            }
+          }
+          if (timedImage === null) {
+            cellElements.imgElement.src = '/test_icon_192.png';
+            continue;
+          }
+          
+          drawCell(cellElements, timedImage, imgTimestampMs);
+        }
       }
     }, 1000);
 
