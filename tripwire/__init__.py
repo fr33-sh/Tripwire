@@ -26,6 +26,7 @@ import json
 class SensorSecret:
     def __init__(self, secret_max = 1000000):
         self.secret = secrets.randbelow(secret_max)
+        self._is_destroyed = False
         # TODO: Init a key pair?
 
     def destroy(self):
@@ -34,6 +35,25 @@ class SensorSecret:
         """
         self.secret = secrets.randbits(64)
         self.secret = None
+        self._is_destroyed = True
+
+    def is_destroyed(self):
+        return self._is_destroyed
+
+class Keys:
+    def __init__(self):
+        self.privkey = Ed25519PrivateKey.generate()
+        self.pubkey = self.privkey.public_key()
+        self.pubkey_pem = self.pubkey.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        # Not needed for now. Just saving as a reference.
+        self.privkey_pem = self.privkey.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
 
 
 def create_app():
@@ -64,25 +84,16 @@ def create_app():
         "cam": SensorSecret()
     }
 
+    # TODO: Should each sensor get its own key pair?
+    keys = Keys()
+
     # Keep all image data sent through Socket.IO within the last ? minutes.
     all_img_data = {}
 
-    # TODO: Should each sensor get its own key pair?
-    privkey = Ed25519PrivateKey.generate()
-    pubkey = privkey.public_key()
-    pubkey_pem = pubkey.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    # Not needed for now. Just saving as a reference.
-    privkey_pem = privkey.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-
     # A dict is better than an array for the idempotence of PUT.
     push_subs = {}
+
+    detection_time = None
 
 
     def probe_pir():
@@ -90,9 +101,16 @@ def create_app():
             if pir.motion_detected:
                 print("PIR motion is detected!")
                 sensor_secrets["pir"].destroy()
-                post_detection()
-                break
+                push_notify("Motion detected by PIR sensor!")
+
+                nonlocal detection_time
+                if detection_time == None:
+                    detection_time = datetime.now()
+
+                return
+
             sleep(0.5)
+
 
     def probe_cam():
 
@@ -101,47 +119,75 @@ def create_app():
         # Continuously capture images and compare SSIMs.
         curr_img_arr = init_img_arr
         while True:
+            nonlocal detection_time, keys
+
             iter_start_time = time.time()
 
             next_img_arr = picam.capture_array()
 
-            ssim_vs_init = ssim(init_img_arr, next_img_arr)
-            ssim_vs_next = ssim(curr_img_arr, next_img_arr)
+            # Only compare SSIMs if the cam secret isn't destroyed yet,
+            # which means the camera hasn't detected anything.
+            # Do this regardless of whether the PIR sensor detected anything.
+            if not sensor_secrets["cam"].is_destroyed():
+                ssim_vs_init = ssim(init_img_arr, next_img_arr)
+                ssim_vs_next = ssim(curr_img_arr, next_img_arr)
 
-            if ssim_vs_init < app.config["SERVER"]["MIN_SSIM_VS_INIT"]:
-                print("The SSIM between the initial and latest photos exceeds the threshold!")
-                sensor_secrets["cam"].destroy()
-                post_detection()
-                break
-            if ssim_vs_next < app.config["SERVER"]["MIN_SSIM_VS_NEXT"]:
-                print("The SSIM between the two latest photos exceeds the threshold!")
-                sensor_secrets["cam"].destroy()
-                post_detection()
-                break
+                if ssim_vs_init < app.config["SERVER"]["MIN_SSIM_VS_INIT"]:
+                    print("The SSIM between the initial and latest photos exceeds the threshold!")
+                    sensor_secrets["cam"].destroy()
+                    push_notify("Motion detected by camera!")
+                    if detection_time == None:
+                        detection_time = datetime.now()
+                if ssim_vs_next < app.config["SERVER"]["MIN_SSIM_VS_NEXT"]:
+                    print("The SSIM between the two latest photos exceeds the threshold!")
+                    sensor_secrets["cam"].destroy()
+                    push_notify("Motion detected by camera!")
+                    if detection_time == None:
+                        detection_time = datetime.now()
 
             curr_img_arr = next_img_arr
 
-            # If already post detection, the post detection loop will handle the
-            # emitting, signing, and saving of photos.
-            if not is_post_detection:
-                # Convert the Numpy image array to JPEG, then to Base64.
-                curr_img_buf = io.BytesIO()
-                curr_img = PIL.Image.fromarray(curr_img_arr)
-                curr_img.save(curr_img_buf, format="JPEG")
-                # `getvalue` gets the entire content while
-                # `read` would require a `seek(0)`.
-                curr_img_bytes = curr_img_buf.getvalue()
-                curr_img_b64 = b64encode(curr_img_bytes).decode("utf-8")
-                # Sign and save.
-                datetime_ = datetime.now()
-                sign_photo_and_save(privkey, datetime_, curr_img_bytes)
-                # Broadcast the image Base64 to clients via Socket.IO
-                curr_img_data = {
-                    "timestamp": datetime_.timestamp(),
-                    "image_b64": curr_img_b64,
-                    "reget": False
-                }
-                emit_and_record_img_data(curr_img_data)
+            # Convert the Numpy image array to JPEG, then to Base64.
+            curr_img_buf = io.BytesIO()
+            curr_img = PIL.Image.fromarray(curr_img_arr)
+            curr_img.save(curr_img_buf, format="JPEG")
+            # `getvalue` gets the entire content while
+            # `read` would require a `seek(0)`.
+            curr_img_bytes = curr_img_buf.getvalue()
+            curr_img_b64 = b64encode(curr_img_bytes).decode("utf-8")
+
+            # Get the time again because comparing SSIMs could take time.
+            datetime_ = datetime.now()
+
+            curr_img_data = {
+                "timestamp": datetime_.timestamp(),
+                "image_b64": curr_img_b64,
+                "reget": False
+            }
+
+            # Sign and save.
+            # Has detected something
+            if detection_time != None:
+                # Within the signing window after detection
+                if (datetime_ - detection_time).seconds < \
+                    app.config["SERVER"]["POST_DETECTION"]["SECS_DEL_KEYS"]:
+                    sig = sign_photo_and_save(keys.privkey, datetime_, curr_img_bytes)
+                    sig_b64 = b64encode(sig).decode("utf-8")
+                    curr_img_data["sig_b64"] = sig_b64
+                # Past the signing window after detection
+                else:
+                    # Try to erase the private key.
+                    keys.privkey = random.randint(10000000, 99999999)
+                    # Just save the photo.
+                    datetime_str = datetime_.strftime("%Y-%m-%d %H:%M:%S")
+                    with open("./instance/captures/" + datetime_str + ".jpg", "wb") as f:
+                        f.write(curr_img_bytes)
+            # No detection
+            else:
+                sign_photo_and_save(keys.privkey, datetime_, curr_img_bytes)
+
+            # Broadcast the image Base64 to clients via Socket.IO
+            emit_and_record_img_data(curr_img_data)
 
             # Maintain the iteration to be 1-second long if it's too fast.
             # Note: If the resolution is high, e.g. 1920x1080, it takes longer than
@@ -156,87 +202,23 @@ def create_app():
                 )
 
 
-    # This function should only be called once.
-    # This has been the case during preliminary testing.
-    # But is there a way to guarantee it?
-    is_post_detection = False
-    def post_detection():
-        nonlocal is_post_detection
-        if is_post_detection:
-            return
-        is_post_detection = True
-
-        detection_time = datetime.now()
-
-        print(f"post_detection is called at {detection_time}")
-
-        # Notify the user via web push.
+    def push_notify(msg):
         for endpoint, sub in push_subs.items():
             try:
                 webpush(
                     sub,
-                    "Motion detected!",
+                    msg,
                     vapid_private_key="/home/pi/tripwire/instance/vapid/private_key.pem",
                     vapid_claims={"sub": "mailto:test@test.test"}
                 )
             except WebPushException as e:
                 print(e)
 
-        while True:
-            iter_start_time = time.time()
 
-            # Capture a new image.
-            img_buf = io.BytesIO()
-            picam.capture_file(img_buf, format="jpeg")
-
-            datetime_ = datetime.now()
-            img_bytes = img_buf.getvalue()
-
-            nonlocal privkey
-            sig = None
-            if (datetime_ - detection_time).seconds < \
-                app.config["SERVER"]["POST_DETECTION"]["SECS_DEL_KEYS"]:
-                sig = sign_photo_and_save(privkey, datetime_, img_bytes)
-            else:
-                # Try to erase the private key.
-                privkey = random.randint(10000000, 99999999)
-                # Just save the photo.
-                datetime_str = datetime_.strftime("%Y-%m-%d %H:%M:%S")
-                with open("./instance/captures/" + datetime_str + ".jpg", "wb") as f:
-                    f.write(img_bytes)
-
-
-            # Use this to verify. None is always returned.
-            # Exception is raised on verification failure.
-            #print(pubkey.verify(sig, img_buf.getvalue()))
-
-            # Broadcast the image Base64 to clients via Socket.IO
-            img_b64 = b64encode(img_bytes).decode("utf-8")
-            img_data = {
-                "timestamp": datetime_.timestamp(),
-                "image_b64": img_b64,
-                "reget": False
-            }
-            if sig:
-                sig_b64 = b64encode(sig).decode("utf-8")
-                img_data["sig_b64"] = sig_b64
-            emit_and_record_img_data(img_data)
-
-            # Maintain the iteration interval.
-            secs_elapsed = time.time() - iter_start_time
-            secs_remain = app.config["SERVER"]["POST_DETECTION"]["CAM_CAP_INTERVAL"] - secs_elapsed
-            if secs_remain < 0:
-                print(
-                    f"An iteration of `post_detection` took {secs_elapsed} "
-                    "seconds which is too long."
-                )
-            elif secs_remain > 0.2:  # Skip sleeping if secs_remain is small.
-                sleep(secs_remain)
-
-    def sign_photo_and_save(privkey, datetime_, img_bytes):
+    def sign_photo_and_save(privkey, datetime_, photo_bytes):
         # Sign the date time followed by the image's hash.
         datetime_str = datetime_.strftime("%Y-%m-%d %H:%M:%S")
-        img_hash = sha256(img_bytes).hexdigest()
+        img_hash = sha256(photo_bytes).hexdigest()
         signed_str = datetime_str + "," + img_hash
         sig = privkey.sign(signed_str.encode("utf-8"))
         # Save the image and the sig.
@@ -244,7 +226,7 @@ def create_app():
         img_path = base_path + ".jpg"
         sig_path = base_path + ".sig"
         with open(img_path, "wb") as f:
-            f.write(img_bytes)
+            f.write(photo_bytes)
         with open(sig_path, "wb") as f:
             f.write(sig)
         return sig
@@ -269,6 +251,8 @@ def create_app():
     app = Flask(__name__, instance_relative_config=True)
     app.config.from_file("config.yaml", load=yaml.safe_load)
     socketio = SocketIO(app)
+    probe_pir_thread = Thread(target=probe_pir)
+    probe_cam_thread = Thread(target=probe_cam)
 
     # Config the camera with the same config from camera tuning,
     # because the camera should be used the same as how it was tuned.
@@ -323,11 +307,61 @@ def create_app():
     @app.route("/bootstrap")
     def bootstrap():
         return {
-            "pubkey_pem": pubkey_pem.decode("utf-8"),
+            "pubkey_pem": keys.pubkey_pem.decode("utf-8"),
             "server_start_time": server_start_time,
             "client_config": app.config["CLIENT"]
         }
 
+    isArmed = False
+    @app.route("/arm")
+    def arm():
+        nonlocal isArmed
+        if not isArmed:
+            # TODO: With Flask, is it a good idea to probe sensors in a thread?
+            #       And will it be better to use gpiozero callbacks?
+            # Note: With a thread, pressing Ctrl-C doesn't seem to
+            #       immediately stop the program. Why?
+            probe_pir_thread.start()
+            probe_cam_thread.start()
+            socketio.start_background_task(secrets_broadcast)
+
+            isArmed = True
+            return "You armed the server.", 200
+        else:
+            return "The server is already armed!\r\n" \
+                "If you see this, there may be a bug somewhere." , 409
+
+    @app.route("/re-arm")
+    def re_arm():
+        nonlocal detection_time, keys, probe_pir_thread, probe_cam_thread
+
+        # Re-generate the secrets and keys.
+        sensor_secrets["pir"] = SensorSecret()
+        sensor_secrets["cam"] = SensorSecret()
+        keys = Keys()
+
+        detection_time = None
+
+        # Restart the PIR thread if it stopped.
+        if not probe_pir_thread.is_alive():
+            probe_pir_thread = Thread(target=probe_pir)
+            probe_pir_thread.start()
+            print("Restarted the PIR thread.")
+        assert probe_cam_thread.is_alive(), "How has the cam thread stopped?"
+
+        return {
+            "pir": sensor_secrets["pir"].secret,
+            "cam": sensor_secrets["cam"].secret,
+            "pubkey_pem": keys.pubkey_pem.decode("utf-8")
+        }
+
+    @app.route("/preview")
+    def preview():
+        photo_buf = io.BytesIO()
+        picam.capture_file(photo_buf, format="JPEG")
+        photo_bytes = photo_buf.getvalue()
+        photo_b64 = b64encode(photo_bytes).decode("utf-8")
+        return photo_b64
 
     @app.route("/vapid-app-server-key")
     def get_vapid_app_server_key():
@@ -377,19 +411,5 @@ def create_app():
                 f"Client tries to reget photos but we don't have these timestamps: "
                 f"{truly_miss_timestamps}"
             )
-
-    # TODO: Wait some time before arming so that
-    # the user can put the Pi at a proper place.
-    #sleep(10)
-
-    # TODO: With Flask, is it a good idea to probe sensors in a thread?
-    #       And will it be better to use gpiozero callbacks?
-    # Note: With a thread, pressing Ctrl-C doesn't seem to
-    #       immediately stop the program. Why?
-    pir_thread = Thread(target=probe_pir)
-    pir_thread.start()
-    cam_thread = Thread(target=probe_cam)
-    cam_thread.start()
-    secrets_broadcast_thread = socketio.start_background_task(secrets_broadcast)
 
     return app
