@@ -9,7 +9,7 @@
 
   Note that this seems to make the app not installable on at least 
   desktop Brave. The icons don't seem to work either. -->
-  <link rel="manifest" href='data:application/manifest+json,{"short_name": "Tripwire","name": "Tripwire AEM","start_url": "/","icons": [{"src": "/test_icon_192.png","sizes": "192x192","type": "image/png"},{"src": "/test_icon_512.png","sizes": "512x512","type": "image/png"}],"display": "standalone"}' />
+  <link rel="manifest" href='data:application/manifest+json,{"short_name": "Tripwire","name": "Tripwire AEM","start_url": "/","icons": [{"src": "/no_image_192.png","sizes": "192x192","type": "image/png"},{"src": "/no_image_512.png","sizes": "512x512","type": "image/png"}],"display": "standalone"}' />
 
   <!-- For browsers other than IOS Safari, this is the
   common way to link to the manifest. -->
@@ -208,7 +208,7 @@
         bar.appendChild(sigSymbol);
         // The img
         let imgElement = new Image();
-        imgElement.src = '/test_icon_192.png';
+        imgElement.src = '/no_image_192.png';
         imgElement.classList.add('image-grid-img');
         cell.appendChild(imgElement);
       }
@@ -1031,7 +1031,7 @@
 
           let photoDataIndex = (pageNum - 1) * imageGridSize + i;
           if (photoDataIndex > sortedPhotoData.length - 1) {
-            cellElements.imgElement.src = '/test_icon_192.png';
+            cellElements.imgElement.src = '/no_image_192.png';
             continue;
           }
           let photoTimestampMs = sortedPhotoData[photoDataIndex][0] * 1000;
@@ -1075,7 +1075,7 @@
             }
           }
           if (timedImage === null) {
-            cellElements.imgElement.src = '/test_icon_192.png';
+            cellElements.imgElement.src = '/no_image_192.png';
             continue;
           }
           
