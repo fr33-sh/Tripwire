@@ -15,7 +15,7 @@ Traditional monitoring systems can't help them defend against strong adversaries
 
 Tripwire's solution is simple. Before the user deploys Tripwire, the server at home, which runs on a Raspberry Pi 5, shares some random secrets with the web client on user's mobile device. After Tripwire is deployed and the user leaves home, they can view a stream of photos which are captured by RPi's camera module and sent to the web client. If any motion is detected by RPi's camera module or motion sensor, the server will delete those secrets immediately, in addition to sending push notifications to the web client. This way, even when the attacker gets physical access to both the target device and the RPi and compromise both of them, they can't restore those secrets. And when the user sees a mismatch between the secrets on the web client and the ones sent from the server, they know that there has been a detection. Here is a demo video for this concept:
 
-https://raw.githubusercontent.com/fr33-sh/Tripwire/refs/heads/main/demo/demo.mp4
+https://github.com/user-attachments/assets/2e8fbde4-8e36-4e81-9c1b-c86268d02e73
 
 Other than the secrets, the server also has a separate cryptographic key pair, whose public key is shared with the web client, that signs the first few seconds of photos after detection before the key pair is deleted. This way the user can unmistakably see the brief moment after detection, which either catches a glimpse of the intruder, or shows a false positive, in which case the user can remotely re-arm Tripwire (generating new secrets and key pair). If the user sets up full-disk encryption (FDE) on the RPi, it will make it difficult to tamper with the photo log on the disk as well.
 
