@@ -4,7 +4,7 @@
 Evil maid attacks, first defined by Joanna Rutkowska ([source](https://blog.invisiblethings.org/2009/10/15/evil-maid-goes-after-truecrypt.html)), has been a difficult threat to people who care about their device security and personal privacy. In an evil maid attack, the attacker gets physical access to the target device when the user left it at home or in a hotel room. They secretly compromise the device in order to spy on the user's past **and future** activities, without the user ever noticing. Because physical access gives the attacker so much control, currently there is no software or firmware solution that effectively defends against evil maid attacks. Even though there are Secure Boot and Trusted Platform Modules (TPM), it is still possible for the attacker to install something like a hardware keylogger to bypass those defenses.
 
 ## How can Tripwire help?
-Start by thinking of Tripwire as a home monitoring system. However, traditional home monitoring products can only defend against burglars, who are not technically-sophisticated and only want to steal money. For higher-profile users, such as:
+Tripwire is a robust monitoring system **that defends against sophisticated adversaries**. In comparison, traditional home monitoring products can only defend against burglars, who are not technically-sophisticated and only want to steal money. For higher-profile users, such as:
 - Developers of critical software (recall the xz backdoor)
 - High-ranking officials in businesses/organizations
 - Investigative journalists
@@ -268,4 +268,14 @@ Create a file named `pubkey.pem` and paste in the server public key PEM that you
 ./verify_sigs.sh pubkey.pem instance/captures/
 ```
 Replace `instance/captures/` with the full path to the `instance/captures/` directory on the microSD card. The script will verify all photos who have signatures. If any signature is verified to be invalid, then an attacker has probably tampered with the photos. If the photos stopped having signatures a while before the user returns to the deployment area, then an attacker has probably been detected.
-TODO: Implement `verify_sigs.sh`.
+
+*Note: verify_sigs.sh hasn't been implemented yet. You can still verify signature for one photo manually. Let pubkey.pem contain the public key in PEM format that you copied from the web client. Let str.txt be 'YYYY-mm-dd HH:MM:SS,<hash>' without trailing new line, where '<hash>' is the target photo's SHA256 hash. Let <sig> be the target photo's signature file. The command is:*
+```
+openssl pkeyutl -verify -pubin -inkey pubkey.pem -rawin -in str.txt -sigfile instance/captures/<sig>
+```
+
+## Limitation
+Currently it is unclear how to securely delete a piece of data (in our case: the secrets) from the disk and the memory, so that it cannot be recovered. Suggestions are welcome.
+
+## Inspiration
+Tripwire is inspired by [Haven](https://github.com/guardianproject/haven), which is a previous anti evil maid system that also detects intrusion with sensors. In comparison, Tripwire is more robust and has more features, while Haven is easier to set up. Unfortunately, Haven has been broken due to difficulty with sending notifications to the user and other problems (See their latest issues [here](https://github.com/guardianproject/haven/issues)).
