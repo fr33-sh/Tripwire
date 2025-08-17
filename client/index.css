@@ -12,7 +12,7 @@
   max-width: 100%;
 }
 
-#time, #pir-secret, #cam-secret, #pubkey-pem, #storage-status, #memory-status, #photo-counts {
+#armed-status, #time, #pir-secret, #cam-secret, #pubkey-pem, #storage-status, #memory-status, #photo-counts {
   white-space: pre-line;
 }
 

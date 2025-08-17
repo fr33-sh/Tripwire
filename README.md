@@ -138,9 +138,9 @@ Using xcaddy, build Caddy with these two plugins:
 1. The dynamic DNS plugin.
 2. The specific DNS provider plugin for the domain registrar you are using.
 ```
-xcaddy build --with github.com/mholt/caddy-dynamicdns --with github.com/caddy-dns/<YOUR DNS PROVIDER>
+xcaddy build --with github.com/mholt/caddy-dynamicdns --with github.com/caddy-dns/[YOUR DNS PROVIDER]
 ```
-Replace <YOUR DNS PROVIDER> with the name of your DNS provider. If you don't know who your DNS provider is, then it is probably the same as your domain registrar (where you get the domain). All available DNS provider plugins can be found here: https://caddyserver.com/docs/modules/. Their names start with a prefix of "dns.providers". The description of each plugin shows the exact URL to be used for the second `--with` in the command. You can also find the GitHub repositories of these DNS provider plugins here: https://github.com/orgs/caddy-dns/repositories
+Replace [YOUR DNS PROVIDER] with the name of your DNS provider. If you don't know who your DNS provider is, then it is probably the same as your domain registrar (where you get the domain). All available DNS provider plugins can be found here: https://caddyserver.com/docs/modules/. Their names start with a prefix of "dns.providers". The description of each plugin shows the exact URL to be used for the second `--with` in the command. You can also find the GitHub repositories of these DNS provider plugins here: https://github.com/orgs/caddy-dns/repositories
 
 So, if your DNS provider is Duck DNS, then you should run this command:
 ```
@@ -235,7 +235,7 @@ Spawn another terminal for Caddy:
 caddy run --config Caddyfile
 ```
 
-See if there are any errors from either terminal. If not, you can browse to https://<your-domain> on your phone, or https://<your-domain>:<port> if you forwarded a different port on your router, enter the credentials you've set up for Caddy's Basic Auth, and get to Tripwire's web client!
+See if there are any errors from either terminal. If not, you can browse to https://[your-domain] on your phone, or https://[your-domain]:[port] if you forwarded a different port on your router, enter the credentials you've set up for Caddy's Basic Auth, and get to Tripwire's web client!
 
 ### Deploying Tripwire
 The first thing you need to do is installing Tripwire as a Progressive Web App (PWA), especially on iPhones. This enables Tripwire to send you web push notifications, which is crucial when Tripwire detects intrusion. After installing and opening the PWA, you need to click "Enable Push Notification" to enable it, at least on iPhones. 
@@ -263,21 +263,23 @@ Before the server deletes the key pair, it will send back photos with signatures
 It is strongly recommended that you test the intrusion detection with yourself a few times to get familiar with Tripwire's user interface.
 
 ### Network outage
-If the network is temporarily disabled, then you can simply click "Re-acquire Missing Photos". Secrets comparison and signature verification will still work. If the network is persistently disabled, then you can't compare the secrets from the web client. In this case, you will need to enter the deployment area, power off the RPi, and take out the microSD card. Plug the microSD card into a computer other than the device you were protecting, because you can't trust that it wasn't compromised yet. You can use a friend's laptop or a random computer in a random public library.
+If the network is temporarily disabled, then you can simply click "Re-acquire Missing Photos". Secrets comparison and signature verification will still work. If the network is persistently disabled, then you can't compare the secrets from the web client. In this case, you will need to enter the deployment area, note down your time of entry, power off the RPi, and take out the microSD card. Plug the microSD card into a computer other than the device you were protecting, because you can't trust that it wasn't compromised yet. You can use a friend's laptop or a random computer in a random public library.
 
-Create a file named `pubkey.pem` and paste in the server public key PEM that you saved earlier. Then, download the script named `verify_sigs.sh` from Tripwire's GitHub repository, and run it against the directory that contains all the photos and their signature files. The command should look like this:
+On the new computer, copy the `instance/captures/` directory (which is located under Tripwire's root directory) from the microSD card onto the hard drive. Assume it is named `captures/`. Create a file named `photo_pubkey.pem` and paste in the server public key PEM that you saved earlier. Then, download the script named `verify_photo_log.sh` from Tripwire's GitHub repository, and run:
 ```
-./verify_sigs.sh pubkey.pem instance/captures/
+./verify_photo_log.sh photo_pubkey.pem captures/
 ```
-Replace `instance/captures/` with the full path to the `instance/captures/` directory on the microSD card. The script will verify all photos who have signatures. If any signature is verified to be invalid, then an attacker has probably tampered with the photos. If the photos stopped having signatures a while before the user returns to the deployment area, then an attacker has probably been detected.
+The script will verify all photos that have signatures. If any signature is verified to be invalid, then an attacker has probably tampered with the photos. If the photos stopped having signatures a while before the user returns to the deployment area, then an attacker has probably been detected.
 
-*Note: verify_sigs.sh hasn't been implemented yet. You can still verify signature for one photo manually. Let pubkey.pem contain the public key in PEM format that you copied from the web client. Let str.txt be 'YYYY-mm-dd HH:MM:SS,<hash>' without trailing new line, where '<hash>' is the target photo's SHA256 hash. Let <sig> be the target photo's signature file. The command is:*
-```
-openssl pkeyutl -verify -pubin -inkey pubkey.pem -rawin -in str.txt -sigfile instance/captures/<sig>
-```
+Note: For the new computer, either boot it into a Linux distro, or use things like git bash if you are on Windows or Mac. This process hasn't been tested on Windows or Mac yet.
 
 ## Limitation
-Currently it is unclear how to securely delete a piece of data (in our case: the secrets) from the disk and the memory, so that it cannot be recovered. Suggestions are welcome.
+Tripwire's current limitations include:
+* It is unclear how to securely delete a piece of data (in our case: the secrets) from the disk and the memory, so that it cannot be recovered. Suggestions are welcome.
+* If the attacker can deliberately trigger a false positive, they can disable the network, trigger the false positive first, then enter the deployment area and compromise the target devices and Tripwire. Because the false positive will cause Tripwire to delete its signing key for the photo log, and the attacker will only be captured in the unsigned photos after the false positive, this means the attacker can replace the legitimate unsigned photos with forged ones that don't show their appearance.
+  * Tripwire still makes things harder for the attacker because this attack requires the attacker to know how to trigger a false positive.
+* Tripwire's web-based architecure makes it easier to work at the user's home or on other networks that they control. For hotels, which are generally places of concern for evil maid attacks, currently the user can't run Tripwire because they probably can't do port-forwarding on hotel networks. This is an obstacle for HTTPS, and HTTPS is critical for Tripwire.
+  * A solution is to run a relay server on a cloud service and let it relay communication between Tripwire's server and client. The relay server is on the roadmap.
 
 ## Inspiration
 Tripwire is inspired by [Haven](https://github.com/guardianproject/haven), which is a previous anti evil maid system that also detects intrusion with sensors. In comparison, Tripwire is more robust and has more features, while Haven is easier to set up. Unfortunately, Haven has been broken due to difficulty with sending notifications to the user and other problems (See their latest issues [here](https://github.com/guardianproject/haven/issues)).
